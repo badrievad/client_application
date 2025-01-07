@@ -1,3 +1,4 @@
+import argparse
 import os
 import subprocess
 import sys
@@ -6,27 +7,44 @@ import time
 
 import requests
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from packaging import version
 
 from config import UPDATE_CHECK_URL  # URL для проверки обновлений
 from logger import logging
 
-# Текущая версия приложения
-VERSION = "1.0.0"
-CHECK_INTERVAL = 3600  # Интервал проверки в секундах (1 час)
-
-
 # Flask приложение
 app = Flask(__name__)
+CORS(app)
+
+
+# Загружаем текущую версию из файла
+def load_version():
+    try:
+        with open("version.txt", "r") as file:
+            return file.read().strip()
+    except FileNotFoundError:
+        logging.warning("Файл версии не найден. Используется версия по умолчанию.")
+        return "1.0.0"
+
+
+# Сохраняем новую версию в файл
+def save_version(new_version):
+    try:
+        with open("version.txt", "w") as file:
+            file.write(new_version)
+        logging.info(f"Версия обновлена до: {new_version}")
+    except Exception as e:
+        logging.error(f"Ошибка сохранения версии: {e}")
 
 
 # Основной маршрут для открытия папок
-@app.route("/open-folder", methods=["POST"])
+@app.route("/open-deal-folder", methods=["POST"])
 def open_folder():
     folder_path = request.json.get("folder_path")
+    logging.info(f"Папка для открытия: {folder_path}")
     if folder_path and os.path.exists(folder_path):
         try:
-            # Открываем папку в зависимости от ОС
             if os.name == "nt":  # Windows
                 os.startfile(folder_path)
             elif os.uname().sysname == "Darwin":  # macOS
@@ -41,17 +59,17 @@ def open_folder():
 
 # Функция проверки обновлений
 def check_for_updates():
+    """Проверяет наличие обновлений и загружает новую версию, если доступна."""
     while True:
         try:
-            logging.info(f"Текущая версия: {VERSION}. Проверка обновлений...")
+            current_version = load_version()
+            logging.info(f"Текущая версия: {current_version}. Проверка обновлений...")
 
             response = requests.get(UPDATE_CHECK_URL)
             logging.info(f"Ответ от сервера: {response.status_code}")
             if response.status_code == 200:
                 data = response.json()
-
                 latest_version = data.get("version")
-                logging.info(f"Последняя версия: {latest_version}")
                 download_url = data.get("download_url")
 
                 if not latest_version or not download_url:
@@ -60,19 +78,19 @@ def check_for_updates():
                     )
                     continue
 
-                # Сравниваем версии
-                if version.parse(latest_version) > version.parse(VERSION):
+                if version.parse(latest_version) > version.parse(current_version):
                     logging.info(
                         f"Доступна новая версия: {latest_version}. Скачивание..."
                     )
-                    download_and_update(download_url)
+                    download_and_update(download_url, latest_version)
                 else:
-                    logging.info("Новых обновлений нет.")
+                    logging.info(
+                        f"Новых обновлений нет. Версия на сервере: {latest_version}"
+                    )
             else:
                 logging.warning(
                     f"Не удалось получить обновления. Статус: {response.status_code}"
                 )
-
         except requests.ConnectionError:
             logging.error("Ошибка соединения с сервером. Проверьте подключение.")
         except requests.Timeout:
@@ -80,50 +98,38 @@ def check_for_updates():
         except Exception as e:
             logging.error(f"Ошибка проверки обновлений: {e}")
 
-        # Ждём перед следующей проверкой
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(20)  # Проверяем обновления каждый час
 
 
 # Функция загрузки и установки новой версии
-def download_and_update(download_url):
+def download_and_update(download_url, latest_version):
+    """
+    Скачивает новую версию, сохраняет её, записывает новую версию в файл
+    и запускает обновление.
+    """
     try:
-        # Скачиваем файл
+        new_version_path = f"client_app_v{latest_version}.exe"
         response = requests.get(download_url, stream=True)
         if response.status_code == 200:
-            new_version_path = "client_app_new.exe"
             with open(new_version_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024):
                     f.write(chunk)
-            logging.info("Обновление скачано. Замена старой версии...")
-
-            # Перезапускаем приложение с новой версией
-            restart_application(new_version_path)
+            logging.info(f"Новая версия скачана: {new_version_path}")
+            save_version(latest_version)
+            logging.info(f"Новая версия {latest_version} сохранена в version.txt.")
+            subprocess.Popen([new_version_path, "--wait", "3"])
+            sys.exit(0)
+        else:
+            logging.error(f"Ошибка загрузки файла. Статус: {response.status_code}")
     except Exception as e:
         logging.error(f"Ошибка загрузки обновления: {e}")
 
 
-# Функция перезапуска приложения
-def restart_application(new_version_path=None):
-    try:
-        current_exe = sys.argv[0]
-        if new_version_path:
-            # Создаём резервную копию текущей версии
-            os.rename(current_exe, current_exe + ".old")
-            # Заменяем старый файл новым
-            os.rename(new_version_path, current_exe)
-
-        # Перезапускаем приложение
-        subprocess.Popen([current_exe])
-        sys.exit(0)
-    except Exception as e:
-        logging.error(f"Ошибка при перезапуске: {e}")
-
-
-# Основной запуск приложения
+# Запуск приложения
 if __name__ == "__main__":
-    # Запуск проверки обновлений в отдельном потоке
     threading.Thread(target=check_for_updates, daemon=True).start()
-
-    # Запуск Flask приложения
-    app.run(host="localhost", port=5001)
-    logging.info("Flask приложение запущено")
+    logging.info(f"Flask приложение запущено на порте 5001")
+    try:
+        app.run(host="localhost", port=5001)
+    except Exception as e:
+        logging.error(f"Ошибка запуска Flask приложения: {e}")
